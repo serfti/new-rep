@@ -29,11 +29,10 @@ CURRENCY_EMOJI = {"USD": "💵", "EUR": "💶", "UAH": "💴"}
 
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="➕ Трата"), KeyboardButton(text="💰 Доход")],
         [KeyboardButton(text="📊 Статистика")],
-        [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📅 Неделя")],
-        [KeyboardButton(text="📅 Месяц")],
-        [KeyboardButton(text="🧾 Последние операции")],
-        [KeyboardButton(text="📋 Категории")],
+        [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📅 Неделя"), KeyboardButton(text="📅 Месяц")],
+        [KeyboardButton(text="🧾 Последние операции"), KeyboardButton(text="📋 Категории")],
     ],
     resize_keyboard=True
 )
@@ -42,6 +41,23 @@ back_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🔙 Назад")]],
     resize_keyboard=True
 )
+
+
+def categories_kb(cats: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for cat in cats:
+        rows.append([
+            InlineKeyboardButton(text=cat, callback_data=f"noop"),
+            InlineKeyboardButton(text="🗑", callback_data=f"delcat:{cat}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ Добавить категорию", callback_data="cat_add")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def expense_cats_kb(cats: list[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=cat, callback_data=f"selcat:{cat}")] for cat in cats]
+    rows.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="cancel_expense")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # =========================
@@ -323,6 +339,58 @@ async def cb_use_misc(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(lambda c: c.data == "noop")
+async def cb_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("delcat:"))
+async def cb_delcat(callback: CallbackQuery):
+    uid = callback.from_user.id
+    cat = callback.data.split(":", 1)[1]
+    async with aiosqlite.connect("finance.db") as db:
+        await db.execute("DELETE FROM categories WHERE user_id=? AND name=?", (uid, cat))
+        await db.commit()
+    cats = await get_categories(uid)
+    if cats:
+        await callback.message.edit_text(
+            "📋 Категории (нажми 🗑 чтобы удалить):",
+            reply_markup=categories_kb(cats),
+        )
+    else:
+        await callback.message.edit_text("📋 Категорий нет.\nДобавь через кнопку ниже.",
+                                          reply_markup=categories_kb([]))
+    await callback.answer(f"🗑 «{cat}» удалена")
+
+
+@dp.callback_query(lambda c: c.data == "cat_add")
+async def cb_cat_add(callback: CallbackQuery):
+    uid = callback.from_user.id
+    user_state[uid] = "add_category"
+    await callback.message.answer("Напиши название новой категории:", reply_markup=back_kb)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("selcat:"))
+async def cb_selcat(callback: CallbackQuery):
+    uid = callback.from_user.id
+    cat = callback.data.split(":", 1)[1]
+    user_state[uid] = "expense_amount"
+    user_temp[uid] = {"category": cat}
+    await callback.message.edit_text(f"Категория: <b>{cat}</b>\n\nТеперь напиши сумму:\n<code>1500$</code>",
+                                      parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "cancel_expense")
+async def cb_cancel_expense(callback: CallbackQuery):
+    uid = callback.from_user.id
+    user_state.pop(uid, None)
+    user_temp.pop(uid, None)
+    await callback.message.edit_text("Отменено.")
+    await callback.answer()
+
+
 # =========================
 # COMMANDS
 # =========================
@@ -429,6 +497,21 @@ async def handler(message: types.Message):
         await message.answer("Главное меню", reply_markup=main_kb)
         return
 
+    if text == "➕ Трата":
+        cats = await get_categories(uid)
+        await message.answer("Выбери категорию:", reply_markup=expense_cats_kb(cats))
+        return
+
+    if text == "💰 Доход":
+        user_state[uid] = "income_wait"
+        await message.answer(
+            "Напиши сумму дохода:\n"
+            "<code>5000$</code> или <code>5% с 5000$</code>",
+            parse_mode="HTML",
+            reply_markup=back_kb,
+        )
+        return
+
     if text == "📊 Статистика":
         await message.answer(await get_stats_text(uid), reply_markup=main_kb)
         return
@@ -460,22 +543,64 @@ async def handler(message: types.Message):
 
     if text == "📋 Категории":
         cats = await get_categories(uid)
-        cat_list = "\n".join(f"• {c}" for c in cats)
         await message.answer(
-            f"📋 Твои категории:\n\n{cat_list}\n\nДобавить: /addcat название",
-            reply_markup=main_kb,
+            "📋 Категории (нажми 🗑 чтобы удалить):",
+            reply_markup=categories_kb(cats),
         )
         return
 
     if user_state.get(uid) == "add_category":
-        cat = text.lower()
+        cat = text.strip().lower()
         async with aiosqlite.connect("finance.db") as db:
             await db.execute(
                 "INSERT INTO categories (user_id, name) VALUES (?, ?)", (uid, cat)
             )
             await db.commit()
         user_state.pop(uid, None)
-        await message.answer(f"✅ Категория добавлена: {cat}", reply_markup=main_kb)
+        await message.answer(f"✅ Категория «{cat}» добавлена.", reply_markup=main_kb)
+        return
+
+    if user_state.get(uid) == "income_wait":
+        percent = parse_percent_income(text)
+        if percent:
+            await add_transaction(uid, percent["amount"], percent["currency"], "доход", "income")
+            await message.answer(
+                f"✅ Доход: {percent['percent']}% с {percent['base']} {percent['currency']} "
+                f"= {percent['amount']} {percent['currency']}",
+                reply_markup=main_kb,
+            )
+            user_state.pop(uid, None)
+            return
+        income = parse_quick_income(text)
+        if income:
+            await add_transaction(uid, income["amount"], income["currency"], "доход", "income")
+            await message.answer(f"✅ Доход: {income['amount']} {income['currency']}", reply_markup=main_kb)
+            user_state.pop(uid, None)
+            return
+        amount = parse_amount(text)
+        if amount:
+            currency = parse_currency(text)
+            await add_transaction(uid, amount, currency, "доход", "income")
+            await message.answer(f"✅ Доход: {amount} {currency}", reply_markup=main_kb)
+            user_state.pop(uid, None)
+            return
+        await message.answer("Не понял сумму. Попробуй: <code>5000$</code>", parse_mode="HTML")
+        return
+
+    if user_state.get(uid) == "expense_amount":
+        amount = parse_amount(text)
+        currency = parse_currency(text)
+        if not amount:
+            await message.answer("Не понял сумму. Попробуй: <code>1500$</code>", parse_mode="HTML")
+            return
+        category = user_temp.get(uid, {}).get("category", "прочее")
+        await add_transaction(uid, amount, currency, category, "expense")
+        await message.answer(
+            f"✅ Расход: {amount} {currency} ({category})",
+            reply_markup=main_kb,
+        )
+        user_state.pop(uid, None)
+        user_temp.pop(uid, None)
         return
 
     # --- QUICK INPUT ---

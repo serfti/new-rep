@@ -135,6 +135,14 @@ def parse_quick_income(text):
     return {"amount": amount, "currency": currency}
 
 
+def split_note(text: str) -> tuple[str, str | None]:
+    """Разбивает текст на основную строку и заметку (после переноса строки)."""
+    parts = text.split("\n", 1)
+    main = parts[0].strip()
+    note = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+    return main, note
+
+
 # =========================
 # DATABASE
 # =========================
@@ -150,6 +158,7 @@ async def init_db():
                 category TEXT,
                 type TEXT,
                 final_amount REAL,
+                note TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -160,6 +169,11 @@ async def init_db():
                 name TEXT
             )
         """)
+        # миграция: добавить колонку note если её нет
+        try:
+            await db.execute("ALTER TABLE transactions ADD COLUMN note TEXT")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -186,12 +200,12 @@ async def seed_categories(user_id):
             await db.commit()
 
 
-async def add_transaction(user_id, amount, currency, category, tx_type):
+async def add_transaction(user_id, amount, currency, category, tx_type, note=None):
     async with aiosqlite.connect("finance.db") as db:
         await db.execute(
-            "INSERT INTO transactions (user_id, amount, currency, category, type, final_amount) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, amount, currency, category, tx_type, amount),
+            "INSERT INTO transactions (user_id, amount, currency, category, type, final_amount, note) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, amount, currency, category, tx_type, amount, note),
         )
         await db.commit()
 
@@ -280,7 +294,7 @@ async def get_last_operations_text(user_id):
     text = "🧾 Последние 15 операций:\n\n"
     async with aiosqlite.connect("finance.db") as db:
         cursor = await db.execute("""
-            SELECT id, category, amount, currency, type
+            SELECT id, category, amount, currency, type, note
             FROM transactions
             WHERE user_id = ?
             ORDER BY id DESC
@@ -291,9 +305,11 @@ async def get_last_operations_text(user_id):
     if not rows:
         return "Пока нет операций"
 
-    for op_id, category, amount, currency, op_type in rows:
+    for op_id, category, amount, currency, op_type, note in rows:
         label = "Доход" if op_type == "income" else "Расход"
         text += f"ID {op_id} | {category} | {amount} {currency} | {label}\n"
+        if note:
+            text += f"   📝 {note}\n"
 
     text += "\n✏️ Редактировать: /edit ID новая_сумма"
     text += "\n❌ Удалить: /delete ID"
@@ -561,42 +577,41 @@ async def handler(message: types.Message):
         return
 
     if user_state.get(uid) == "income_wait":
-        percent = parse_percent_income(text)
+        main_line, note = split_note(text)
+        percent = parse_percent_income(main_line)
         if percent:
-            await add_transaction(uid, percent["amount"], percent["currency"], "доход", "income")
+            await add_transaction(uid, percent["amount"], percent["currency"], "доход", "income", note)
+            note_str = f"\n📝 {note}" if note else ""
             await message.answer(
                 f"✅ Доход: {percent['percent']}% с {percent['base']} {percent['currency']} "
-                f"= {percent['amount']} {percent['currency']}",
+                f"= {percent['amount']} {percent['currency']}{note_str}",
                 reply_markup=main_kb,
             )
             user_state.pop(uid, None)
             return
-        income = parse_quick_income(text)
-        if income:
-            await add_transaction(uid, income["amount"], income["currency"], "доход", "income")
-            await message.answer(f"✅ Доход: {income['amount']} {income['currency']}", reply_markup=main_kb)
-            user_state.pop(uid, None)
-            return
-        amount = parse_amount(text)
+        amount = parse_amount(main_line)
         if amount:
-            currency = parse_currency(text)
-            await add_transaction(uid, amount, currency, "доход", "income")
-            await message.answer(f"✅ Доход: {amount} {currency}", reply_markup=main_kb)
+            currency = parse_currency(main_line)
+            await add_transaction(uid, amount, currency, "доход", "income", note)
+            note_str = f"\n📝 {note}" if note else ""
+            await message.answer(f"✅ Доход: {amount} {currency}{note_str}", reply_markup=main_kb)
             user_state.pop(uid, None)
             return
         await message.answer("Не понял сумму. Попробуй: <code>5000$</code>", parse_mode="HTML")
         return
 
     if user_state.get(uid) == "expense_amount":
-        amount = parse_amount(text)
-        currency = parse_currency(text)
+        main_line, note = split_note(text)
+        amount = parse_amount(main_line)
+        currency = parse_currency(main_line)
         if not amount:
             await message.answer("Не понял сумму. Попробуй: <code>1500$</code>", parse_mode="HTML")
             return
         category = user_temp.get(uid, {}).get("category", "прочее")
-        await add_transaction(uid, amount, currency, category, "expense")
+        await add_transaction(uid, amount, currency, category, "expense", note)
+        note_str = f"\n📝 {note}" if note else ""
         await message.answer(
-            f"✅ Расход: {amount} {currency} ({category})",
+            f"✅ Расход: {amount} {currency} ({category}){note_str}",
             reply_markup=main_kb,
         )
         user_state.pop(uid, None)
@@ -604,26 +619,29 @@ async def handler(message: types.Message):
         return
 
     # --- QUICK INPUT ---
+    main_line, note = split_note(text)
     cats = await get_categories(uid)
 
     # 1. Percent income: "5% с 5000$"
-    percent = parse_percent_income(text)
+    percent = parse_percent_income(main_line)
     if percent:
-        await add_transaction(uid, percent["amount"], percent["currency"], "доход", "income")
+        await add_transaction(uid, percent["amount"], percent["currency"], "доход", "income", note)
+        note_str = f"\n📝 {note}" if note else ""
         await message.answer(
             f"✅ Доход: {percent['percent']}% с {percent['base']} {percent['currency']} "
-            f"= {percent['amount']} {percent['currency']}",
+            f"= {percent['amount']} {percent['currency']}{note_str}",
             reply_markup=main_kb,
         )
         return
 
     # 2. Quick expense: "1500$ здоровье"
-    expense = parse_quick_expense(text, cats)
+    expense = parse_quick_expense(main_line, cats)
     if expense:
         if expense["found"]:
-            await add_transaction(uid, expense["amount"], expense["currency"], expense["category"], "expense")
+            await add_transaction(uid, expense["amount"], expense["currency"], expense["category"], "expense", note)
+            note_str = f"\n📝 {note}" if note else ""
             await message.answer(
-                f"✅ Расход: {expense['amount']} {expense['currency']} ({expense['category']})",
+                f"✅ Расход: {expense['amount']} {expense['currency']} ({expense['category']}){note_str}",
                 reply_markup=main_kb,
             )
         else:
@@ -646,11 +664,12 @@ async def handler(message: types.Message):
         return
 
     # 3. Quick income: "5000$"
-    income = parse_quick_income(text)
+    income = parse_quick_income(main_line)
     if income:
-        await add_transaction(uid, income["amount"], income["currency"], "доход", "income")
+        await add_transaction(uid, income["amount"], income["currency"], "доход", "income", note)
+        note_str = f"\n📝 {note}" if note else ""
         await message.answer(
-            f"✅ Доход: {income['amount']} {income['currency']}",
+            f"✅ Доход: {income['amount']} {income['currency']}{note_str}",
             reply_markup=main_kb,
         )
         return
